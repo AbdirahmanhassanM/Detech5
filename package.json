@@ -4,7 +4,7 @@
   "description": "Implementation of Ben-Or consensus algorithm",
   "main": "dist/index.js",
   "scripts": {
-    "test": "jest",
+    "test": "jest --runInBand --no-cache --forceExit",
     "build": "tsc",
     "start": "ts-node src/index.ts"
   },

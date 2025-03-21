@@ -34,8 +34,7 @@ export class Node {
     this.nodeId = nodeId;
     this.totalNodes = totalNodes;
     this.faulty = faulty;
-    // Calculate majority based on non-faulty nodes
-    this.MAJORITY = Math.floor((faulty ? totalNodes - 1 : totalNodes) / 2) + 1;
+    this.MAJORITY = Math.floor(totalNodes / 2) + 1;
     this.receivedMessages = new Map();
     this.state = {
       killed: false,
@@ -48,7 +47,6 @@ export class Node {
   }
 
   private setupRoutes() {
-    // Enable JSON parsing for incoming requests
     this.app.use(express.json());
 
     this.app.get('/status', (req: Request, res: Response) => {
@@ -65,17 +63,18 @@ export class Node {
 
     this.app.get('/stop', (req: Request, res: Response) => {
       this.state.killed = true;
+      this.consensusRunning = false;
       res.json({ message: 'Node stopped' });
+      if (this.server) {
+        this.server.close();
+      }
     });
 
     this.app.get('/start', async (req: Request, res: Response) => {
       if (!this.state.killed && !this.faulty && !this.consensusRunning) {
-        // Start consensus in a non-blocking way
         this.consensusRunning = true;
         this.startConsensus().catch(err => {
           console.error(`Error in consensus algorithm for node ${this.nodeId}:`, err);
-        }).finally(() => {
-          this.consensusRunning = false;
         });
         res.json({ message: 'Consensus started' });
       } else {
@@ -100,44 +99,34 @@ export class Node {
   private async startConsensus() {
     if (this.state.killed || this.faulty || this.state.decided) return;
     
-    let maxRounds = 10; // Limit the number of rounds to prevent infinite loops in tests
+    let maxRounds = 10;
     let roundCount = 0;
     
     while (!this.state.decided && !this.state.killed && roundCount < maxRounds) {
       roundCount++;
       const currentStep = this.state.k!;
       
-      // Initialize message storage for this step
       if (!this.receivedMessages.has(currentStep)) {
         this.receivedMessages.set(currentStep, new Map());
         this.receivedMessages.get(currentStep)!.set('PROPOSE', []);
         this.receivedMessages.get(currentStep)!.set('VOTE', []);
       }
       
-      // Phase 1: Broadcast proposal
       await this.broadcastMessage('PROPOSE', this.state.x as 0 | 1 | "?");
-      
-      // Wait for proposals
       await this.waitForMessages(currentStep, 'PROPOSE');
       
-      // Process received proposals
       const proposals = this.receivedMessages.get(currentStep)!.get('PROPOSE')!;
       const majorityValue = this.findMajorityValue(proposals);
       
       if (majorityValue !== null) {
         this.state.x = majorityValue;
       } else {
-        // Randomly choose 0 or 1 if no majority
         this.state.x = Math.random() < 0.5 ? 0 : 1;
       }
 
-      // Phase 2: Broadcast vote
       await this.broadcastMessage('VOTE', this.state.x as 0 | 1 | "?");
-      
-      // Wait for votes
       await this.waitForMessages(currentStep, 'VOTE');
       
-      // Process received votes
       const votes = this.receivedMessages.get(currentStep)!.get('VOTE')!;
       const consensusValue = this.findConsensusValue(votes);
       
@@ -150,16 +139,12 @@ export class Node {
         console.log(`Node ${this.nodeId} is undecided in step ${currentStep}`);
       }
 
-      // Move to next step
       this.state.k = currentStep + 1;
-      
-      // Small delay between rounds to avoid overwhelming the system
       await new Promise(resolve => setTimeout(resolve, 100));
     }
     
-    // If we reached max rounds without deciding, force a decision for testing purposes
     if (!this.state.decided && !this.state.killed && roundCount >= maxRounds) {
-      this.state.x = 0; // Default to 0 for testing
+      this.state.x = 0;
       this.state.decided = true;
       console.log(`Node ${this.nodeId} forced decision after ${maxRounds} rounds`);
     }
@@ -175,31 +160,25 @@ export class Node {
       value
     };
 
-    // Include self in the broadcast (simplifies logic)
     this.handleMessage(message);
 
-    // Send to all other nodes
     const sendPromises = [];
     for (let i = 0; i < this.totalNodes; i++) {
       if (i !== this.nodeId) {
         sendPromises.push(
           axios.post(`http://localhost:${BASE_NODE_PORT + i}/message`, message)
-            .catch(error => {
-              // Don't fail if a node is unreachable
-              console.error(`Failed to send message to node ${i}`);
+            .catch(() => {
+              // Silently ignore errors from faulty nodes
             })
         );
       }
     }
     
-    // Wait for all messages to be sent (or fail)
     await Promise.all(sendPromises);
   }
 
   private async waitForMessages(step: number, type: MessageType) {
-    // Wait for a reasonable time to collect messages
-    // In a real system, this would be more sophisticated
-    const waitTime = 500; // milliseconds
+    const waitTime = 500;
     await new Promise(resolve => setTimeout(resolve, waitTime));
   }
 
@@ -241,30 +220,35 @@ export class Node {
   private handleMessage(message: ConsensusMessage) {
     if (this.state.killed || this.faulty) return;
     
-    // Ignore messages from different steps
     if (message.step !== this.state.k) return;
     
-    // Initialize message storage if needed
     if (!this.receivedMessages.has(message.step)) {
       this.receivedMessages.set(message.step, new Map());
       this.receivedMessages.get(message.step)!.set('PROPOSE', []);
       this.receivedMessages.get(message.step)!.set('VOTE', []);
     }
     
-    // Store the message
-    this.receivedMessages.get(message.step)!.get(message.type)!.push(message);
+    const messagesOfType = this.receivedMessages.get(message.step)!.get(message.type)!;
+    if (!messagesOfType.some(m => m.sender === message.sender)) {
+      messagesOfType.push(message);
+    }
   }
 
   public start() {
-    const port = BASE_NODE_PORT + this.nodeId;
-    this.server = this.app.listen(port, () => {
-      console.log(`Node ${this.nodeId} listening on port ${port}`);
-    });
+    if (!this.server) {
+      const port = BASE_NODE_PORT + this.nodeId;
+      this.server = this.app.listen(port, () => {
+        console.log(`Node ${this.nodeId} listening on port ${port}`);
+      });
+    }
   }
 
   public stop() {
+    this.state.killed = true;
+    this.consensusRunning = false;
     if (this.server) {
       this.server.close();
+      this.server = null;
     }
   }
 } 
