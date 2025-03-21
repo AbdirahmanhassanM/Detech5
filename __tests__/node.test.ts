@@ -2,7 +2,7 @@ import axios from 'axios';
 import { Node, BASE_NODE_PORT } from '../src/nodes/node';
 
 // Increase timeout for all tests
-jest.setTimeout(15000);
+jest.setTimeout(30000);
 
 describe('Node Setup Tests', () => {
   let node: Node;
@@ -65,37 +65,46 @@ describe('Node Setup Tests', () => {
   });
 });
 
-// Skip the consensus tests for now as they're causing issues in the test environment
-describe.skip('Consensus Tests', () => {
+describe('Consensus Tests', () => {
   let nodes: Node[];
   const TOTAL_NODES = 3;
 
-  beforeEach(() => {
+  beforeEach(async () => {
+    // Clean up any existing nodes
     nodes = [];
+    // Wait a bit to ensure ports are freed
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    
     for (let i = 0; i < TOTAL_NODES; i++) {
       nodes[i] = new Node(i, (i % 2) as 0 | 1, TOTAL_NODES);
       nodes[i].start();
     }
+    // Wait for all nodes to start
+    await new Promise(resolve => setTimeout(resolve, 1000));
   });
 
-  afterEach(() => {
-    nodes.forEach(node => node.stop());
+  afterEach(async () => {
+    for (const node of nodes) {
+      node.stop();
+    }
+    // Wait for cleanup
+    await new Promise(resolve => setTimeout(resolve, 1000));
   });
 
   it('should reach consensus with no faulty nodes', async () => {
-    // Start consensus on all nodes one by one
-    for (let i = 0; i < TOTAL_NODES; i++) {
+    // Start consensus on all nodes
+    await Promise.all(nodes.map(async (_, i) => {
       try {
         await axios.get(`http://localhost:${BASE_NODE_PORT + i}/start`);
       } catch (error) {
         console.error(`Failed to start consensus on node ${i}:`, error);
       }
-    }
+    }));
 
-    // Wait for consensus to be reached
-    await new Promise(resolve => setTimeout(resolve, 10000));
+    // Wait for consensus to be reached (increased timeout)
+    await new Promise(resolve => setTimeout(resolve, 15000));
 
-    // Check that all nodes have reached consensus
+    // Check final states
     const states = await Promise.all(nodes.map(async (_, i) => {
       try {
         const response = await axios.get(`http://localhost:${BASE_NODE_PORT + i}/getState`);
@@ -106,8 +115,9 @@ describe.skip('Consensus Tests', () => {
       }
     }));
 
-    // Filter out any null states (from failed requests)
+    // Filter out any null states
     const validStates = states.filter(state => state !== null);
+    expect(validStates.length).toBeGreaterThan(0);
     
     // All nodes should have decided
     validStates.forEach(state => {
@@ -115,33 +125,41 @@ describe.skip('Consensus Tests', () => {
     });
 
     // All nodes should have the same value
-    if (validStates.length > 0) {
-      const consensusValue = validStates[0].x;
-      validStates.forEach(state => {
-        expect(state.x).toBe(consensusValue);
-      });
-    }
+    const consensusValue = validStates[0].x;
+    validStates.forEach(state => {
+      expect(state.x).toBe(consensusValue);
+    });
   });
 
   it('should handle one faulty node', async () => {
-    // For this test, we'll just verify that we can create a faulty node
-    // and that non-faulty nodes can still function
-    
-    // Stop all nodes first to avoid port conflicts
+    // Stop all nodes and recreate with one faulty
     nodes.forEach(node => node.stop());
+    await new Promise(resolve => setTimeout(resolve, 1000));
     
-    // Create new nodes with one faulty
     nodes = [];
-    nodes.push(new Node(0, 0, TOTAL_NODES, true)); // Faulty node
-    for (let i = 1; i < TOTAL_NODES; i++) {
-      nodes.push(new Node(i, 0, TOTAL_NODES, false)); // All nodes with same initial value for testing
-    }
+    // Create one faulty node and two normal nodes
+    nodes.push(new Node(0, 0, TOTAL_NODES, true));
+    nodes.push(new Node(1, 0, TOTAL_NODES, false));
+    nodes.push(new Node(2, 0, TOTAL_NODES, false));
     
     // Start all nodes
     nodes.forEach(node => node.start());
+    await new Promise(resolve => setTimeout(resolve, 1000));
 
-    // Check that we can get the state of non-faulty nodes
-    const nonFaultyStates = await Promise.all(nodes.slice(1).map(async (_, i) => {
+    // Start consensus on non-faulty nodes
+    await Promise.all(nodes.slice(1).map(async (_, i) => {
+      try {
+        await axios.get(`http://localhost:${BASE_NODE_PORT + i + 1}/start`);
+      } catch (error) {
+        console.error(`Failed to start consensus on node ${i + 1}:`, error);
+      }
+    }));
+
+    // Wait for consensus
+    await new Promise(resolve => setTimeout(resolve, 15000));
+
+    // Check states of non-faulty nodes
+    const states = await Promise.all(nodes.slice(1).map(async (_, i) => {
       try {
         const response = await axios.get(`http://localhost:${BASE_NODE_PORT + i + 1}/getState`);
         return response.data;
@@ -150,25 +168,28 @@ describe.skip('Consensus Tests', () => {
         return null;
       }
     }));
-    
-    // Filter out any null states (from failed requests)
-    const validStates = nonFaultyStates.filter(state => state !== null);
-    
-    // We should have at least one valid state
+
+    const validStates = states.filter(state => state !== null);
     expect(validStates.length).toBeGreaterThan(0);
-    
-    // All non-faulty nodes should have the same initial value
+
+    // Non-faulty nodes should have reached consensus
     validStates.forEach(state => {
-      expect(state.x).toBe(0);
-      expect(state.decided).toBe(false);
+      expect(state.decided).toBe(true);
     });
-    
-    // Test passes if we can verify non-faulty nodes are working
+
+    // All non-faulty nodes should have the same value
+    const consensusValue = validStates[0].x;
+    validStates.forEach(state => {
+      expect(state.x).toBe(consensusValue);
+    });
   });
 
   it('should stop consensus when node is killed', async () => {
     // Start consensus
     await axios.get(`http://localhost:${BASE_NODE_PORT}/start`);
+    
+    // Give it some time to start
+    await new Promise(resolve => setTimeout(resolve, 1000));
     
     // Kill the node
     await axios.get(`http://localhost:${BASE_NODE_PORT}/stop`);
